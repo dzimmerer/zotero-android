@@ -68,6 +68,16 @@
     <string name="pdf_reader_sidebar">Sidebar</string>
     <string name="pdf_reader_plain_reader">Plain Reader</string>
     <string name="pdf_reader_toolbar">Toolbar</string>
+    <string name="pdf_reader_gemini_chat">Gemini Chat</string>
+    <string name="pdf_reader_gemini_close">Close Gemini Chat</string>
+    <string name="pdf_reader_gemini_api_key">Gemini API Key</string>
+    <string name="pdf_reader_gemini_clear">Clear</string>
+    <string name="pdf_reader_gemini_ask_label">Ask about this paper</string>
+    <string name="pdf_reader_gemini_send">Send</string>
+    <string name="pdf_reader_gemini_settings">Settings</string>
+    <string name="pdf_reader_gemini_save">Save</string>
+    <string name="pdf_reader_gemini_cancel">Cancel</string>
+    <string name="pdf_reader_openrouter_api_key">OpenRouter API Key</string>
 
     <string name="items_generating_cit">Generating Citation</string>
 

@@ -61,4 +61,13 @@ interface PdfReaderVMInterface {
     fun onCopyCitation()
     fun onCopyBibliography()
     fun hideCopyCitation()
+    fun toggleGeminiChat()
+    fun hideGeminiChat()
+    fun onGeminiApiKeyChanged(key: String)
+    fun onOpenRouterApiKeyChanged(key: String)
+    fun onGeminiProviderSelected(provider: ChatModelProvider)
+    fun onGeminiModelSelected(model: String)
+    fun onGeminiInputChanged(input: String)
+    fun onGeminiClearHistory()
+    fun onGeminiSend()
 }

@@ -39,7 +39,9 @@ internal fun PdfReaderTopBar(
     toPdfPlainReader: () -> Unit,
     onShowHidePdfSearch: () -> Unit,
     toggleToolbarButton: () -> Unit,
+    toggleGeminiChat: () -> Unit,
     isToolbarButtonSelected: Boolean,
+    isGeminiChatSelected: Boolean,
     showSideBar: Boolean,
     showPdfSearch: Boolean,
     viewState: PdfReaderViewState,
@@ -140,6 +142,25 @@ internal fun PdfReaderTopBar(
                     selectedDrawableRes = Drawables.draw_filled,
                     onToggle = toggleToolbarButton,
                     isSelected = isToolbarButtonSelected
+                )
+            }
+            TooltipBox(
+                positionProvider = rememberTooltipPositionProvider(
+                    TooltipAnchorPosition.Below,
+                    4.dp
+                ),
+                tooltip = {
+                    PlainTooltip() {
+                        Text(stringResource(Strings.pdf_reader_gemini_chat))
+                    }
+                },
+                state = rememberTooltipState()
+            ) {
+                IconWithPaddingM3(
+                    unselectedDrawableRes = Drawables.note_add_24,
+                    selectedDrawableRes = Drawables.note_add_24,
+                    onToggle = toggleGeminiChat,
+                    isSelected = isGeminiChatSelected,
                 )
             }
 

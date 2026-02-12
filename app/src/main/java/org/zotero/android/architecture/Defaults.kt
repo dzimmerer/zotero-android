@@ -51,6 +51,11 @@ open class Defaults @Inject constructor(
     private val exportStyleId = "exportStyleId"
     private val exportLocaleId = "exportLocaleId"
     private val quickCopyAsHtml = "quickCopyAsHtml"
+    private val geminiApiKey = "geminiApiKey"
+    private val openRouterApiKey = "openRouterApiKey"
+    private val geminiModelProvider = "geminiModelProvider"
+    private val geminiModel = "geminiModel"
+    private val geminiPaperHistoryPrefix = "geminiPaperHistory_"
 
     private val exportOutputMode = "exportOutputMode"
     private val exportOutputMethod = "exportOutputMethod"
@@ -181,6 +186,46 @@ open class Defaults @Inject constructor(
 
     fun getApiToken(): String? {
         return sharedPreferences.getString(apiToken, null )
+    }
+
+    fun setGeminiApiKey(str: String) {
+        sharedPreferences.edit { putString(geminiApiKey, str) }
+    }
+
+    fun getGeminiApiKey(): String {
+        return sharedPreferences.getString(geminiApiKey, "" )!!
+    }
+
+    fun setGeminiModel(str: String) {
+        sharedPreferences.edit { putString(geminiModel, str) }
+    }
+
+    fun getGeminiModel(): String {
+        return sharedPreferences.getString(geminiModel, "gemini-3-flash-preview")!!
+    }
+
+    fun setGeminiModelProvider(str: String) {
+        sharedPreferences.edit { putString(geminiModelProvider, str) }
+    }
+
+    fun getGeminiModelProvider(): String {
+        return sharedPreferences.getString(geminiModelProvider, "Gemini")!!
+    }
+
+    fun setOpenRouterApiKey(str: String) {
+        sharedPreferences.edit { putString(openRouterApiKey, str) }
+    }
+
+    fun getOpenRouterApiKey(): String {
+        return sharedPreferences.getString(openRouterApiKey, "" )!!
+    }
+
+    fun setGeminiPaperHistoryJson(paperKey: String, historyJson: String) {
+        sharedPreferences.edit { putString(geminiPaperHistoryPrefix + paperKey, historyJson) }
+    }
+
+    fun getGeminiPaperHistoryJson(paperKey: String): String {
+        return sharedPreferences.getString(geminiPaperHistoryPrefix + paperKey, "[]") ?: "[]"
     }
 
     fun isUserLoggedIn() :Boolean {

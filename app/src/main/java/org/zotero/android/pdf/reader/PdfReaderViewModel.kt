@@ -74,9 +74,14 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
+import org.json.JSONArray
 import org.json.JSONObject
 import org.zotero.android.ZoteroApplication
 import org.zotero.android.androidx.content.copyHtmlToClipboard
@@ -112,6 +117,7 @@ import org.zotero.android.database.requests.EditTagsForItemDbRequest
 import org.zotero.android.database.requests.MarkObjectsAsDeletedDbRequest
 import org.zotero.android.database.requests.ReadAnnotationsDbRequest
 import org.zotero.android.database.requests.ReadDocumentDataDbRequest
+import org.zotero.android.database.requests.ReadItemDbRequest
 import org.zotero.android.database.requests.StorePageForItemDbRequest
 import org.zotero.android.database.requests.key
 import org.zotero.android.files.FileStore
@@ -185,9 +191,12 @@ import org.zotero.android.sync.Tag
 import org.zotero.android.uicomponents.Strings
 import timber.log.Timber
 import java.io.File
+import java.io.InterruptedIOException
 import java.nio.charset.StandardCharsets
+import java.net.SocketTimeoutException
 import java.util.EnumSet
 import java.util.Timer
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Provider
 import kotlin.concurrent.timerTask
@@ -263,6 +272,13 @@ class PdfReaderViewModel @Inject constructor(
     private var shouldPreserveFilterResultsBetweenReinitializations = false
 
     private var initialPage: Int? = null
+    private var latestSelectedTextContext: String? = null
+    private var latestSelectedTextSource: String? = null
+    private val geminiClient = OkHttpClient.Builder()
+        .callTimeout(45, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .build()
 
     @Inject
     lateinit var citationControllerProvider: Provider<CitationController>
@@ -578,6 +594,7 @@ class PdfReaderViewModel @Inject constructor(
 
     private fun setOnPreparePopupToolbarListener() {
         this.pdfFragment.setOnPreparePopupToolbarListener { toolbar ->
+            captureSelectionTextFromToolbar(toolbar)
             val sourceItems = toolbar.menuItems.toMutableList()
             val menuItems = sourceItems.listIterator()
 
@@ -602,6 +619,19 @@ class PdfReaderViewModel @Inject constructor(
                 Strings.pdf_highlight
             )
             toolbar.menuItems = sourceItems
+        }
+    }
+
+    private fun captureSelectionTextFromToolbar(toolbar: Any) {
+        val capture = extractTextDeep(toolbar, source = toolbar.javaClass.simpleName)
+        val selectedText = capture?.text
+
+        if (!selectedText.isNullOrBlank()) {
+            Timber.i("Gemini: captured selection from toolbar source=${capture?.source} len=${selectedText.length} preview=${selectedText.take(120)}")
+            latestSelectedTextContext = selectedText
+            latestSelectedTextSource = capture?.source ?: "toolbar"
+        } else {
+            Timber.i("Gemini: toolbar selection capture failed for ${toolbar.javaClass.name}")
         }
     }
 
@@ -787,6 +817,17 @@ class PdfReaderViewModel @Inject constructor(
         this.activeEraserSize = defaults.getActiveEraserSize()
         this.activeFontSize = defaults.getActiveFontSize()
         this.initialPage = params.page
+        val initialProvider = runCatching {
+            ChatModelProvider.valueOf(defaults.getGeminiModelProvider())
+        }.getOrDefault(ChatModelProvider.Gemini)
+        val initialGeminiModel = defaults.getGeminiModel().takeIf {
+            GeminiChatModels.supported(initialProvider).contains(it)
+        } ?: GeminiChatModels.defaultModel(initialProvider)
+        val geminiPaperKey = geminiPaperStorageKey(
+            libraryId = params.library.identifier.toString(),
+            paperKey = params.parentKey ?: params.key
+        )
+        val initialHistory = parseGeminiHistory(defaults.getGeminiPaperHistoryJson(geminiPaperKey))
 
         updateState {
             copy(
@@ -797,6 +838,11 @@ class PdfReaderViewModel @Inject constructor(
                 username = username,
                 displayName = displayName,
                 visiblePage = 0,
+                geminiApiKey = defaults.getGeminiApiKey(),
+                openRouterApiKey = defaults.getOpenRouterApiKey(),
+                geminiModelProvider = initialProvider,
+                geminiSelectedModel = initialGeminiModel,
+                geminiMessages = initialHistory,
                 selectedAnnotationKey = params.preselectedAnnotationKey?.let {
                     AnnotationKey(
                         key = it,
@@ -3588,6 +3634,768 @@ class PdfReaderViewModel @Inject constructor(
         }
     }
 
+    override fun toggleGeminiChat() {
+        updateState {
+            copy(showGeminiChat = !showGeminiChat)
+        }
+    }
+
+    override fun hideGeminiChat() {
+        updateState {
+            copy(showGeminiChat = false)
+        }
+    }
+
+    override fun onGeminiApiKeyChanged(key: String) {
+        defaults.setGeminiApiKey(key)
+        updateState {
+            copy(geminiApiKey = key)
+        }
+    }
+
+    override fun onOpenRouterApiKeyChanged(key: String) {
+        defaults.setOpenRouterApiKey(key)
+        updateState {
+            copy(openRouterApiKey = key)
+        }
+    }
+
+    override fun onGeminiProviderSelected(provider: ChatModelProvider) {
+        defaults.setGeminiModelProvider(provider.name)
+        val nextModel = viewState.geminiSelectedModel.takeIf {
+            GeminiChatModels.supported(provider).contains(it)
+        } ?: GeminiChatModels.defaultModel(provider)
+        defaults.setGeminiModel(nextModel)
+        updateState {
+            copy(
+                geminiModelProvider = provider,
+                geminiSelectedModel = nextModel
+            )
+        }
+    }
+
+    override fun onGeminiModelSelected(model: String) {
+        if (!GeminiChatModels.supported(viewState.geminiModelProvider).contains(model)) {
+            return
+        }
+        defaults.setGeminiModel(model)
+        updateState {
+            copy(geminiSelectedModel = model)
+        }
+    }
+
+    override fun onGeminiInputChanged(input: String) {
+        updateState {
+            copy(geminiInput = input)
+        }
+    }
+
+    override fun onGeminiClearHistory() {
+        persistGeminiHistory(emptyList())
+        updateState {
+            copy(
+                geminiMessages = emptyList(),
+                geminiError = null,
+                geminiDebugInfo = null
+            )
+        }
+    }
+
+    override fun onGeminiSend() {
+        val question = viewState.geminiInput.trim()
+        if (question.isBlank()) {
+            return
+        }
+        when (viewState.geminiModelProvider) {
+            ChatModelProvider.Gemini -> {
+                if (viewState.geminiApiKey.isBlank()) {
+                    updateState {
+                        copy(geminiError = "Gemini API key is required.")
+                    }
+                    return
+                }
+            }
+
+            ChatModelProvider.OpenRouter -> {
+                if (viewState.openRouterApiKey.isBlank()) {
+                    updateState {
+                        copy(geminiError = "OpenRouter API key is required.")
+                    }
+                    return
+                }
+            }
+        }
+
+        val userMessage = GeminiChatMessage(
+            role = GeminiChatRole.User,
+            content = question
+        )
+        val debugSelection = currentSelectionText()
+        val debugAnnotationContext = annotationTextContext()
+        val debugExtractedText = fullExtractedPdfText()
+        val debugInfo = buildString {
+            appendLine("Gemini debug")
+            appendLine("provider=${viewState.geminiModelProvider.name}")
+            appendLine("model=${viewState.geminiSelectedModel}")
+            appendLine("selection.length=${debugSelection?.length ?: 0}")
+            appendLine("selection.preview=${debugSelection?.take(180) ?: "<none>"}")
+            appendLine("selection.source=${latestSelectedTextSource ?: "<none>"}")
+            appendLine("annotations.length=${debugAnnotationContext.length}")
+            appendLine("annotations.preview=${debugAnnotationContext.take(180).ifBlank { "<none>" }}")
+            appendLine("extracted.length=${debugExtractedText.length}")
+            appendLine("extracted.preview=${debugExtractedText.take(180).ifBlank { "<none>" }}")
+        }
+        Timber.i(debugInfo)
+        val messagesAfterUser = viewState.geminiMessages + userMessage
+        persistGeminiHistory(messagesAfterUser)
+        updateState {
+            copy(
+                geminiInput = "",
+                geminiMessages = messagesAfterUser,
+                geminiIsSending = true,
+                geminiError = null,
+                geminiDebugInfo = debugInfo
+            )
+        }
+
+        viewModelScope.launch {
+            val responseText = withContext(dispatcher) {
+                sendGeminiPrompt(
+                    provider = viewState.geminiModelProvider,
+                    apiKey = viewState.geminiApiKey,
+                    openRouterApiKey = viewState.openRouterApiKey,
+                    model = viewState.geminiSelectedModel,
+                    question = question,
+                    includeFullContext = true
+                )
+            }
+            if (responseText == null) {
+                Timber.e(
+                    "Gemini: final request failed. provider=%s model=%s questionLen=%d historyCount=%d",
+                    viewState.geminiModelProvider.name,
+                    viewState.geminiSelectedModel,
+                    question.length,
+                    viewState.geminiMessages.size
+                )
+            }
+
+            val assistantMessage = GeminiChatMessage(
+                role = GeminiChatRole.Assistant,
+                content = responseText ?: "No response received from Gemini."
+            )
+            val allMessages = messagesAfterUser + assistantMessage
+            persistGeminiHistory(allMessages)
+            updateState {
+                copy(
+                    geminiMessages = allMessages,
+                    geminiIsSending = false,
+                    geminiError = if (responseText == null) "Gemini request failed." else null
+                )
+            }
+        }
+    }
+
+    private fun sendGeminiPrompt(
+        provider: ChatModelProvider,
+        apiKey: String,
+        openRouterApiKey: String,
+        model: String,
+        question: String,
+        includeFullContext: Boolean,
+    ): String? {
+        val prompt = buildGeminiPrompt(
+            question = question,
+            includeFullContext = includeFullContext
+        )
+        Timber.i(
+            "Gemini: request start provider=%s model=%s includeFullContext=%s promptLen=%d questionLen=%d",
+            provider.name,
+            model,
+            includeFullContext,
+            prompt.length,
+            question.length
+        )
+        return try {
+            val result = when (provider) {
+                ChatModelProvider.Gemini -> requestGemini(
+                    apiKey = apiKey,
+                    model = model,
+                    prompt = prompt
+                )
+
+                ChatModelProvider.OpenRouter -> requestOpenRouter(
+                    apiKey = openRouterApiKey,
+                    model = model,
+                    prompt = prompt
+                )
+            }
+            if (result == null) {
+                Timber.w(
+                    "Gemini: empty response payload. provider=%s model=%s includeFullContext=%s",
+                    provider.name,
+                    model,
+                    includeFullContext
+                )
+            } else {
+                Timber.i(
+                    "Gemini: request success provider=%s model=%s includeFullContext=%s responseLen=%d",
+                    provider.name,
+                    model,
+                    includeFullContext,
+                    result.length
+                )
+            }
+            result
+        } catch (e: Exception) {
+            Timber.e(
+                e,
+                "Gemini: request failed provider=%s model=%s includeFullContext=%s promptLen=%d",
+                provider.name,
+                model,
+                includeFullContext,
+                prompt.length
+            )
+            if (includeFullContext && e.isTimeoutError()) {
+                val retryPrompt = buildGeminiPrompt(
+                    question = question,
+                    includeFullContext = false
+                )
+                Timber.w(
+                    "Gemini: timeout detected, retrying with reduced context. provider=%s model=%s retryPromptLen=%d",
+                    provider.name,
+                    model,
+                    retryPrompt.length
+                )
+                return try {
+                    val retryResult = when (provider) {
+                        ChatModelProvider.Gemini -> requestGemini(
+                            apiKey = apiKey,
+                            model = model,
+                            prompt = retryPrompt
+                        )
+
+                        ChatModelProvider.OpenRouter -> requestOpenRouter(
+                            apiKey = openRouterApiKey,
+                            model = model,
+                            prompt = retryPrompt
+                        )
+                    }
+                    if (retryResult == null) {
+                        Timber.w("Gemini: retry returned empty response. provider=%s model=%s", provider.name, model)
+                    } else {
+                        Timber.i("Gemini: retry success. provider=%s model=%s responseLen=%d", provider.name, model, retryResult.length)
+                    }
+                    retryResult
+                } catch (_: Exception) {
+                    Timber.e("Gemini: retry failed. provider=%s model=%s", provider.name, model)
+                    null
+                }
+            }
+            null
+        }
+    }
+
+    private fun requestGemini(
+        apiKey: String,
+        model: String,
+        prompt: String,
+    ): String? {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+        val safeUrl = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
+        val jsonBody = JSONObject()
+            .put(
+                "contents",
+                JSONArray().put(
+                    JSONObject().put(
+                        "parts",
+                        JSONArray().put(JSONObject().put("text", prompt))
+                    )
+                )
+            )
+            .toString()
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val request = Request.Builder()
+            .url(url)
+            .post(jsonBody.toRequestBody(mediaType))
+            .build()
+        geminiClient.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string().orEmpty()
+            Timber.i(
+                "Gemini: HTTP response model=%s code=%d success=%s url=%s responseLen=%d",
+                model,
+                response.code,
+                response.isSuccessful,
+                safeUrl,
+                responseBody.length
+            )
+            if (!response.isSuccessful) {
+                Timber.e(
+                    "Gemini: HTTP failure model=%s code=%d bodyPreview=%s",
+                    model,
+                    response.code,
+                    responseBody.take(800)
+                )
+                throw IllegalStateException("Gemini HTTP ${response.code}: $responseBody")
+            }
+            val root = JSONObject(responseBody)
+            val candidates = root.optJSONArray("candidates") ?: return null
+            if (candidates.length() == 0) {
+                Timber.w("Gemini: no candidates in response. model=%s bodyPreview=%s", model, responseBody.take(800))
+                return null
+            }
+            val first = candidates.optJSONObject(0) ?: return null
+            val parts = first.optJSONObject("content")?.optJSONArray("parts") ?: return null
+            if (parts.length() == 0) {
+                Timber.w("Gemini: no content parts in response. model=%s bodyPreview=%s", model, responseBody.take(800))
+                return null
+            }
+            val textParts = mutableListOf<String>()
+            for (idx in 0 until parts.length()) {
+                val part = parts.optJSONObject(idx) ?: continue
+                val text = part.optString("text", "")
+                if (text.isNotBlank()) {
+                    textParts.add(text)
+                }
+            }
+            return textParts.joinToString("\n\n").ifBlank { null }
+        }
+    }
+
+    private fun requestOpenRouter(
+        apiKey: String,
+        model: String,
+        prompt: String,
+    ): String? {
+        val url = "https://openrouter.ai/api/v1/chat/completions"
+        val jsonBody = JSONObject()
+            .put("model", model)
+            .put(
+                "messages",
+                JSONArray().put(
+                    JSONObject()
+                        .put("role", "user")
+                        .put("content", prompt)
+                )
+            )
+            .toString()
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(jsonBody.toRequestBody(mediaType))
+            .build()
+        geminiClient.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string().orEmpty()
+            Timber.i(
+                "Gemini: OpenRouter HTTP response model=%s code=%d success=%s responseLen=%d",
+                model,
+                response.code,
+                response.isSuccessful,
+                responseBody.length
+            )
+            if (!response.isSuccessful) {
+                Timber.e(
+                    "Gemini: OpenRouter HTTP failure model=%s code=%d bodyPreview=%s",
+                    model,
+                    response.code,
+                    responseBody.take(800)
+                )
+                throw IllegalStateException("OpenRouter HTTP ${response.code}: $responseBody")
+            }
+            val root = JSONObject(responseBody)
+            val choices = root.optJSONArray("choices") ?: return null
+            if (choices.length() == 0) {
+                Timber.w("Gemini: OpenRouter no choices. model=%s bodyPreview=%s", model, responseBody.take(800))
+                return null
+            }
+            val message = choices.optJSONObject(0)?.optJSONObject("message")
+            val contentValue = message?.opt("content")
+            val content = when (contentValue) {
+                is String -> contentValue.trim()
+                is JSONArray -> {
+                    buildString {
+                        for (i in 0 until contentValue.length()) {
+                            val part = contentValue.opt(i)
+                            when (part) {
+                                is String -> append(part)
+                                is JSONObject -> append(part.optString("text", ""))
+                            }
+                        }
+                    }.trim()
+                }
+
+                else -> ""
+            }
+            if (content.isNotBlank()) {
+                return content
+            }
+            Timber.w("Gemini: OpenRouter empty content. model=%s bodyPreview=%s", model, responseBody.take(800))
+            return null
+        }
+    }
+
+    private fun buildGeminiPrompt(
+        question: String,
+        includeFullContext: Boolean,
+    ): String {
+        val metadata = buildGeminiMetadataContext()
+        val selectedText = currentSelectionText()
+        val annotationTextContext = annotationTextContext()
+        val extractedText = if (includeFullContext) {
+            fullExtractedPdfText().take(120_000)
+        } else {
+            ""
+        }
+        val discussion = if (includeFullContext) {
+            viewState.geminiMessages.takeLast(12).joinToString("\n") {
+                val role = if (it.role == GeminiChatRole.User) "User" else "Assistant"
+                "$role: ${it.content}"
+            }
+        } else {
+            viewState.geminiMessages.takeLast(4).joinToString("\n") {
+                val role = if (it.role == GeminiChatRole.User) "User" else "Assistant"
+                "$role: ${it.content.take(1200)}"
+            }
+        }
+
+        return buildString {
+            appendLine("You are helping with a Zotero PDF.")
+            appendLine()
+            appendLine("User question:")
+            appendLine(question)
+            appendLine()
+            appendLine("Paper metadata:")
+            appendLine(metadata.ifBlank { "No metadata available." })
+            appendLine()
+            appendLine("Current reader selection text:")
+            appendLine(selectedText ?: "No active text selection.")
+            appendLine()
+            appendLine("Annotation text context:")
+            appendLine(annotationTextContext.ifBlank { "No annotation text context available." })
+            appendLine()
+            appendLine("Previous discussion:")
+            appendLine(if (discussion.isBlank()) "No previous discussion." else discussion)
+            appendLine()
+            appendLine("Full extracted PDF text:")
+            appendLine(if (extractedText.isBlank()) "Full text unavailable." else extractedText)
+        }
+    }
+
+    private fun buildGeminiMetadataContext(): String {
+        val lines = mutableListOf<String>()
+        val libraryId = viewState.library.identifier
+        try {
+            dbWrapperMain.realmDbStorage.perform { coordinator ->
+                val parentItem = viewState.parentKey?.let { parentKey ->
+                    runCatching {
+                        coordinator.perform(ReadItemDbRequest(libraryId = libraryId, key = parentKey))
+                    }.getOrNull()
+                }
+                val attachmentItem = runCatching {
+                    coordinator.perform(ReadItemDbRequest(libraryId = libraryId, key = viewState.key))
+                }.getOrNull()
+
+                parentItem?.let {
+                    appendMetadata(lines, "Title", readField(it, FieldKeys.Item.title))
+                    val creators = it.creators
+                        .sort("orderId")
+                        .mapNotNull { creator ->
+                            val first = creator.firstName.trim()
+                            val last = creator.lastName.trim()
+                            listOf(first, last).filter { value -> value.isNotBlank() }.joinToString(" ")
+                                .ifBlank { null }
+                        }
+                    if (creators.isNotEmpty()) {
+                        lines.add("Creators: ${creators.joinToString(", ")}")
+                    }
+                    appendMetadata(lines, "Date", readField(it, FieldKeys.Item.date))
+                    appendMetadata(lines, "DOI", readField(it, FieldKeys.Item.doi))
+                    appendMetadata(lines, "URL", readField(it, FieldKeys.Item.url))
+                    appendMetadata(lines, "Publication", readField(it, FieldKeys.Item.publicationTitle))
+                }
+                attachmentItem?.let {
+                    appendMetadata(lines, "Attachment title", readField(it, FieldKeys.Item.Attachment.title))
+                    appendMetadata(lines, "Filename", readField(it, FieldKeys.Item.Attachment.filename))
+                    appendMetadata(lines, "Content type", readField(it, FieldKeys.Item.Attachment.contentType))
+                }
+            }
+        } catch (e: Exception) {
+            Timber.w(e)
+        }
+        return lines.joinToString("\n")
+    }
+
+    private fun appendMetadata(lines: MutableList<String>, key: String, value: String?) {
+        if (!value.isNullOrBlank()) {
+            lines.add("$key: $value")
+        }
+    }
+
+    private fun readField(item: RItem, key: String): String? {
+        return item.fields.firstOrNull { it.key == key }?.value?.takeIf { it.isNotBlank() }
+    }
+
+    private fun currentSelectionText(): String? {
+        val cached = latestSelectedTextContext?.trim()
+        if (!cached.isNullOrBlank()) {
+            Timber.i("Gemini: using cached selection source=${latestSelectedTextSource} len=${cached.length} preview=${cached.take(120)}")
+            return cached
+        }
+        val targets = listOf<Any>(pdfFragment, pdfUiFragment)
+        for (target in targets) {
+            val capture = extractTextDeep(target, source = target.javaClass.simpleName)
+            val str = capture?.text
+            if (!str.isNullOrBlank()) {
+                Timber.i("Gemini: selection via reflection source=${capture?.source} len=${str.length} preview=${str.take(120)}")
+                latestSelectedTextContext = str
+                latestSelectedTextSource = capture?.source ?: target.javaClass.simpleName
+                return str
+            }
+        }
+        Timber.i("Gemini: no selection text available")
+        return null
+    }
+
+    private data class TextCapture(val text: String, val source: String)
+
+    private fun extractTextDeep(
+        target: Any?,
+        depth: Int = 0,
+        visited: MutableSet<Int> = mutableSetOf(),
+        source: String = "root",
+    ): TextCapture? {
+        if (target == null || depth > 6) {
+            return null
+        }
+        if (target is CharSequence) {
+            val text = target.toString().trim().takeIf { it.isNotBlank() } ?: return null
+            return TextCapture(text = text, source = source)
+        }
+        if (target is Iterable<*>) {
+            target.forEachIndexed { index, any ->
+                val capture = extractTextDeep(any, depth + 1, visited, "$source[$index]")
+                if (capture != null) {
+                    return capture
+                }
+            }
+            return null
+        }
+        if (target is Array<*>) {
+            target.forEachIndexed { index, any ->
+                val capture = extractTextDeep(any, depth + 1, visited, "$source[$index]")
+                if (capture != null) {
+                    return capture
+                }
+            }
+            return null
+        }
+        val id = System.identityHashCode(target)
+        if (!visited.add(id)) {
+            return null
+        }
+
+        val preferredNames = listOf(
+            "getSelectedText",
+            "selectedText",
+            "getTextSelection",
+            "getText",
+            "getSelectionText",
+            "getSelection",
+            "getDocumentSelection",
+            "getTextSelectionController",
+            "getTextSelectionManager",
+        )
+        preferredNames.forEach { name ->
+            val method = target.javaClass.methods.firstOrNull {
+                it.name == name && it.parameterTypes.isEmpty()
+            } ?: return@forEach
+            val value = runCatching { method.invoke(target) }.getOrNull()
+            val text = extractTextDeep(
+                target = value,
+                depth = depth + 1,
+                visited = visited,
+                source = "$source.${target.javaClass.simpleName}#$name()"
+            )
+            if (text != null) {
+                return text
+            }
+        }
+
+        val genericMethods = target.javaClass.methods.filter { method ->
+            method.parameterTypes.isEmpty() &&
+                method.returnType != Void.TYPE &&
+                method.name.length <= 40 &&
+                (method.name.contains("text", ignoreCase = true) ||
+                    method.name.contains("selection", ignoreCase = true))
+        }
+        genericMethods.forEach { method ->
+            val value = runCatching { method.invoke(target) }.getOrNull()
+            val text = extractTextDeep(
+                target = value,
+                depth = depth + 1,
+                visited = visited,
+                source = "$source.${target.javaClass.simpleName}#${method.name}()"
+            )
+            if (text != null) {
+                return text
+            }
+        }
+
+        val fields = target.javaClass.declaredFields.filter { field ->
+            field.name.contains("text", ignoreCase = true) || field.name.contains("selection", ignoreCase = true)
+        }
+        fields.forEach { field ->
+            val value = runCatching {
+                field.isAccessible = true
+                field.get(target)
+            }.getOrNull()
+            val text = extractTextDeep(
+                target = value,
+                depth = depth + 1,
+                visited = visited,
+                source = "$source.${target.javaClass.simpleName}.${field.name}"
+            )
+            if (text != null) {
+                return text
+            }
+        }
+
+        return null
+    }
+
+    private fun annotationTextContext(): String {
+        val lines = mutableListOf<String>()
+        val selectedKey = viewState.selectedAnnotationKey
+        if (selectedKey != null) {
+            val selected = annotation(selectedKey)
+            val selectedText = selected?.promptAnnotationText().orEmpty()
+            if (selectedText.isNotBlank()) {
+                lines.add("Selected annotation: $selectedText")
+            }
+        }
+
+        val collected = viewState.sortedKeys
+            .mapNotNull { key -> annotation(key) }
+            .mapNotNull { it.promptAnnotationText() }
+            .distinct()
+            .take(80)
+
+        if (collected.isNotEmpty()) {
+            if (lines.isNotEmpty()) {
+                lines.add("")
+            }
+            lines.add("Paper annotations:")
+            collected.forEachIndexed { index, text ->
+                lines.add("${index + 1}. $text")
+            }
+        }
+
+        return lines.joinToString("\n").take(16_000)
+    }
+
+    private fun PDFAnnotation.promptAnnotationText(): String? {
+        val textValue = this.text?.trim().orEmpty()
+        val commentValue = this.comment.trim()
+        if (textValue.isBlank() && commentValue.isBlank()) {
+            return null
+        }
+        if (textValue.isNotBlank() && commentValue.isNotBlank() && textValue != commentValue) {
+            return "$textValue | comment: $commentValue"
+        }
+        return if (textValue.isNotBlank()) {
+            textValue
+        } else {
+            "comment: $commentValue"
+        }
+    }
+
+    private fun fullExtractedPdfText(): String {
+        val textBuilder = StringBuilder()
+        val pageCount = document.pageCount
+        for (pageIndex in 0 until pageCount) {
+            val pageText = extractPageText(pageIndex)
+            if (!pageText.isNullOrBlank()) {
+                textBuilder.appendLine(pageText)
+            }
+            if (textBuilder.length > 140_000) {
+                break
+            }
+        }
+        if (textBuilder.isNotBlank()) {
+            return textBuilder.toString()
+        }
+        val annotationTextFallback = viewState.sortedKeys
+            .mapNotNull { key -> annotation(key)?.promptAnnotationText() }
+            .joinToString("\n")
+        return annotationTextFallback
+    }
+
+    private fun extractPageText(pageIndex: Int): String? {
+        val methods = listOf("getPageText", "getTextForPage", "getText")
+        for (methodName in methods) {
+            val method = document.javaClass.methods.firstOrNull {
+                it.name == methodName && it.parameterTypes.size == 1 && it.parameterTypes[0] == Int::class.javaPrimitiveType
+            } ?: continue
+            val value = runCatching { method.invoke(document, pageIndex) }.getOrNull() as? CharSequence ?: continue
+            val text = value.toString()
+            if (text.isNotBlank()) {
+                return text
+            }
+        }
+        return null
+    }
+
+    private fun parseGeminiHistory(historyJson: String): List<GeminiChatMessage> {
+        return try {
+            val array = JSONArray(historyJson)
+            (0 until array.length()).mapNotNull { index ->
+                val item = array.optJSONObject(index) ?: return@mapNotNull null
+                val role = when (item.optString("role")) {
+                    "user" -> GeminiChatRole.User
+                    "assistant" -> GeminiChatRole.Assistant
+                    else -> return@mapNotNull null
+                }
+                GeminiChatMessage(
+                    role = role,
+                    content = item.optString("content", ""),
+                    timestampMs = item.optLong("timestampMs", System.currentTimeMillis())
+                )
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun persistGeminiHistory(messages: List<GeminiChatMessage>) {
+        val historyJson = JSONArray().apply {
+            messages.forEach {
+                put(
+                    JSONObject().apply {
+                        put("role", if (it.role == GeminiChatRole.User) "user" else "assistant")
+                        put("content", it.content)
+                        put("timestampMs", it.timestampMs)
+                    }
+                )
+            }
+        }.toString()
+        defaults.setGeminiPaperHistoryJson(
+            paperKey = geminiPaperStorageKey(
+                libraryId = viewState.library.identifier.toString(),
+                paperKey = viewState.parentKey ?: viewState.key
+            ),
+            historyJson = historyJson
+        )
+    }
+
+    private fun geminiPaperStorageKey(libraryId: String, paperKey: String): String {
+        return "$libraryId:$paperKey"
+    }
+
+    private fun Exception.isTimeoutError(): Boolean {
+        return this is SocketTimeoutException || this is InterruptedIOException
+    }
+
     override fun onCopyBibliography() {
         dismissSharePopup()
 
@@ -3693,6 +4501,16 @@ data class PdfReaderViewState(
     val showSingleCitationScreen: Boolean = false,
     val isGeneratingBibliography: Boolean = false,
     val isExportingAnnotatedPdf: Boolean = false,
+    val showGeminiChat: Boolean = false,
+    val geminiApiKey: String = "",
+    val openRouterApiKey: String = "",
+    val geminiModelProvider: ChatModelProvider = ChatModelProvider.Gemini,
+    val geminiSelectedModel: String = GeminiChatModels.defaultModel(ChatModelProvider.Gemini),
+    val geminiMessages: List<GeminiChatMessage> = emptyList(),
+    val geminiInput: String = "",
+    val geminiIsSending: Boolean = false,
+    val geminiError: String? = null,
+    val geminiDebugInfo: String? = null,
 ) : ViewState {
 
     fun isAnnotationSelected(annotationKey: String): Boolean {
